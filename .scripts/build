@@ -1,0 +1,154 @@
+#!/bin/bash
+
+set -eo pipefail
+
+PROG=$(basename "$0")
+PROG_DIR=$(dirname "$0")
+
+if [ -t 0 ] && [ -t 1 ]; then
+    Cyan='\033[0;36m'
+    Reset='\033[0m'
+else
+    Cyan=
+    Reset=
+fi
+
+function log {
+    echo -e "[${Cyan}+${Reset}] $1"
+}
+
+function usage {
+    cat <<EOF 1>&2
+usage: $PROG [options...] SOURCEDIR
+Options:
+  -i IMAGE     Name of the docker image (including tag) to use as package build environment.
+  -o DIR       Destination directory to store packages to.
+  -d DIR       Directory that contains other deb packages that need to be installed before build.
+  -p profiles  Specify the profiles to build (e.g. nocheck). Takes a comma separated list.
+  -C           Use ccache to cache compiled objects.
+  -L           Run Lintian after a successful build.
+EOF
+    exit 1
+}
+
+function fatal {
+    echo "$PROG: ${1:-"Unknown Error"}" 1>&2
+    exit 1
+}
+
+function abspath {
+    cd "$1" && pwd
+}
+
+function sanitize_string {
+    local str=${1//_/}
+    str=${str// /_}
+    echo "${str//[^a-zA-Z0-9_]/-}"
+}
+
+
+###########################################################################
+
+[[ $# -eq 0 ]] && usage
+
+while getopts "i:o:p:d:hCL" opt; do
+    case $opt in
+        i)
+            image="$OPTARG"
+            ;;
+        o)
+            outdir="$OPTARG"
+            ;;
+        p)
+            profiles="$OPTARG"
+            ;;
+        d)
+            depdir="$OPTARG"
+            ;;
+        C)
+            use_ccache=1
+            ;;
+        L)
+            run_lintian=1
+            ;;
+        h)
+            usage
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+
+shift $((OPTIND - 1))
+srcdir=$1
+shift
+extra_args=("$@")
+[[ $# -ne 0 ]] && fatal "invalid trailing command line argument(s): ${extra_args[*]}"
+
+if command -v podman >/dev/null 2>&1; then
+    tool=podman
+elif command -v docker >/dev/null 2>&1; then
+    tool=docker
+else
+    fatal "neither podman nor docker found"
+fi
+
+docker_args="-it "
+
+# Check that mandatory parameters are valid
+[[ !    "$outdir"        ]] && fatal "output directory was not given (-o DIR)"
+[[ ! -d "$outdir"        ]] && fatal "output directory does not exist: $outdir"
+[[ !    "$srcdir"        ]] && fatal "source directory not given"
+[[ ! -r "$srcdir/debian" ]] && fatal "source directory does not contain debian sub directory"
+[[ !    "$image"         ]] && fatal "docker image name not given (-i IMAGE)"
+
+# Check that optional parameters are valid
+if [[ "$depdir" ]]; then
+    [[ ! -d "$depdir" ]] && fatal "dependency directory given but does not exist: $depdir"
+    docker_args+="-v $(abspath "$depdir"):/dependencies:ro "
+fi
+
+docker_args+="-v $(abspath "$srcdir"):/source-ro:ro "
+docker_args+="-v $(abspath "$outdir"):/output "
+docker_args+="-v $(cd "$PROG_DIR"; pwd)/build-helper.sh:/build-helper.sh:ro "
+docker_args+="--mount type=tmpfs,tmpfs-size=4G,destination=/tmp "
+
+# Pass current UID and GID to container, so that it can change the
+# ownership of output files which are otherwise written to outdir as
+# root
+[[ ! "$( $tool --version )" =~ "podman" ]] && docker_args+="-e USER=$(id -u) -e GROUP=$(id -g) "
+
+# Comment following out if you want to keep container after execution
+# for debugging
+docker_args+="--rm "
+
+# pass build profiles to use
+if [[ "$profiles" ]]; then
+    docker_args+="--env DEB_BUILD_PROFILES=$profiles --env DEB_BUILD_OPTIONS=$profiles "
+fi
+
+sanitized_image_name=$(sanitize_string "$image")
+
+# share apt package cache
+docker_args+="-v cdebb__${sanitized_image_name}__apt:/var/cache/apt/archives "
+
+# pass whether to use ccache
+if [[ "$use_ccache" ]]; then
+    docker_args+="--env USE_CCACHE=1 -v cdebb__${sanitized_image_name}__ccache:/ccache_dir "
+fi
+
+# pass whether to run Lintian
+if [[ "$run_lintian" ]]; then
+    docker_args+="--env RUN_LINTIAN=1 "
+fi
+
+# disable any selinux stuff while using rh and derivates with podman
+[[ "$( $tool --version )" =~ "podman" ]] && docker_args+="--security-opt label=disable "
+
+cmd="$tool run $docker_args $image /build-helper.sh"
+
+log "Running $tool:"
+log "$cmd"
+
+exec $cmd
