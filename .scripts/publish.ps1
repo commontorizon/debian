@@ -25,10 +25,9 @@ if (
 $tag = $env:DEBIAN_PACKAGES_VERSION
 $_ghDryRun = $null -ne $env:GH_DRY_RUN -and $env:GH_DRY_RUN -eq "true"
 
-$env:GH_TOKEN = Get-Content ../.key/gh.key
-
 # set the repo
-Set-Location ../
+# WARNING: this need to be runned in the root of the repo
+$env:GH_TOKEN = Get-Content ./.key/gh.key
 gh repo set-default commontorizon/debian
 
 if (
